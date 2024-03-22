@@ -16,6 +16,8 @@
 #include <TH1.h>
 #include <TF1.h>
 #include "TCanvas.h"
+#include "TGraph.h"
+#include "TGraph2D.h"
 
 //ATLAS
 #include "xAODRootAccess/Init.h"
@@ -24,24 +26,29 @@
 #include <xAODJet/Jet.h>
 #include "xAODJet/JetContainer.h"
 #include "xAODTruth/TruthParticle.h"
+#include "xAODTruth/TruthVertex.h"
+#include "xAODTruth/xAODTruthHelpers.h"
+#include <xAODJet/JetConstituentVector.h>
 
-
+//fastjet
+#include "fastjet/ClusterSequence.hh"
 
 /***
+ * Needs to be updated:
+ * 
 Program takes in a file specified in first command line argument
 Program takes in an output ID in second command line argument
 Program calculate the energy correlation functions for different jets in the file:
 e2 = (1/M^2) * sum{ (Ei * Ej * angle ij) }
 e3 = (1/M^3) * sum{ (Ei * Ej * Ek * angle ij * angle ik * angle jk) }
 Program calculates D2 discriminant for each jet D2 = e3 / (e2^3) in the rest frame of the jet, and in the lab frame
-Program stores the jet 4-vector, D2's in different frames, and decay angle to a tree
+Program stores the jet 4-vector, D2's in different frames, decay information, and substructure information to a tree
 Program write the tree to a file [output ID]output.root
 
-Version 1.3
-Trying to better match the D2 Paper
--Pt cut at > 400 Gev
--Mass cut changed to < 100 Gev
-Shand Seiffert 6/9/2023
+Version 2.7
+- Back to no pileup, and original setup
+
+Shand Seiffert 6/23/2023
 ***/
 
 
@@ -111,7 +118,13 @@ struct BosonWithDecay
 
 
 
-double getD2rest(xAOD::JetConstituentVector, ROOT::Math::PtEtaPhiMVector, long long);
+const double betaVar = 1.0;
+//power dependence for angles in e2, e3 formulas
+
+const double betaVarRest = 2.0;
+//power dependence for angles in e2, e3 rest formulas
+
+double getD2rest(xAOD::JetConstituentVector, ROOT::Math::PtEtaPhiMVector, long long, double);
 //calculates d2 in the jet rest frame.
 //Input: the array of particles given by JetContainer::GetConstituents, 4-vector of the jet, integer with number of particles in the jet
 //Output: a double which is the D2 in the rest frame of the jet
@@ -126,17 +139,43 @@ std::vector<BosonWithDecay> findBosons(const xAOD::TruthParticleContainer*);
 //Input: truth particle container which holds the truth particles including bosons and their decay products
 //Output: vector of the bosons and their corresponding decay products
 
+const double deltaRcut = 0.4;
+//radius cutoff for truth matching jets
+
 const xAOD::Jet* findMinRJet(const xAOD::JetContainer*, ROOT::Math::PtEtaPhiMVector);
 //Find the jet with the minimum Radius to the vector of interest for truth matching
 //Input: the container with the jets from an event, the vector to compare them to (boson vector)
-//Output: the jet with the minimum radius to the vectir
+//Output: the jet with the minimum radius to the vector
 
+const double subjetRadius = 0.6;
+//radius used for reconstructing subjets
 
+bool subjetOutput = false;
+//boolean for whether the clustering function prints subjet info to the terminal as it processes
 
-//power dependence for angles
-const double betaVar = 1.0;
-//radius cutoff for truth matching jets
-const double deltaRcut = 0.4;
+const std::vector<fastjet::PseudoJet> restClustering(const xAOD::Jet*, double, ROOT::Math::PtEtaPhiMVector);
+//clusters them using antikt to get subjet info in the rest frame
+//Input: The jet, R for clustering, the vector of the frame in which to cluster
+//Output: a vector of subjets
+
+const double extERadiusCutoff = 0.4;
+//the radius cutoff for the external energy calculation below
+
+double externalEnergy(xAOD::JetConstituentVector, std::vector<fastjet::PseudoJet>, ROOT::Math::PtEtaPhiMVector, double);
+//boosts subjet axes into jet frame, and finds how much energy of the jet falls outside a certain radius around the subjet axes
+//input: the jet constituents, the vector of 2 subjets, the number of constituents.
+//output: a double representing the energy percentage.
+
+double subjetAngles(std::vector<fastjet::PseudoJet>, ROOT::Math::PtEtaPhiMVector);
+//takes a vector of two subjets, and boosts into the boson frame and check their angle 
+//(if these are indeed the two subjets desired, will be roughly opposite)
+//Input: Vector with two subjets, vector of the boson frame
+//Output: The angle between these two subjet axes
+
+const std::vector<xAOD::TruthParticle> truthParticlesNoPU(const xAOD::TruthParticle*);
+//takes the origin particle, and finds every particle originating from it
+//input: the desired particle decaying
+//output: a vector of every particle originally coming from input through 1 or multiple decays
 
 
 
@@ -165,6 +204,7 @@ int main(int argc, char* argv[]) {
 	//declaring tree and branches
 	TTree * t = new TTree("tree", "D2 Test");
 	double D2rest, D2lab, ptj, phij, etaj, mj, weightj, d2refj, qAngle, minR, numJets;
+	double leadSubjetPt, numSubjets, subjetAngle, extEnergy1, extEnergy2, extEnergy3;
 	t->Branch("d2rest", &D2rest);
 	t->Branch("d2lab", &D2lab);
 	t->Branch("pt", &ptj);
@@ -176,9 +216,12 @@ int main(int argc, char* argv[]) {
 	t->Branch("decayAngle", &qAngle);
 	t->Branch("minRadius", &minR);
 	t->Branch("jetCount", &numJets);
-
-    //vector to be used for jet boost
-    ROOT::Math::PtEtaPhiMVector jetFrame;
+	t->Branch("leadSubjetPt", &leadSubjetPt);
+	t->Branch("numSubjets", &numSubjets);
+	t->Branch("subjetAngle", &subjetAngle);
+	t->Branch("d2rest1_3", &extEnergy1);
+	t->Branch("d2rest1_7", &extEnergy2);
+	t->Branch("d2rest2_0", &extEnergy3);
 	
 	//preping file for read
 	xAOD::Init();
@@ -187,6 +230,7 @@ int main(int argc, char* argv[]) {
 
 	//set number of entries to be read
 	long long numEntries = event.getEntries();
+	int eventCounter = 0;
 
 	//loop over each jet
 	for (long long eventNumber = 0; eventNumber < numEntries; ++eventNumber) {
@@ -203,6 +247,13 @@ int main(int argc, char* argv[]) {
 
 		const xAOD::TruthParticleContainer* bosonsWithDecayParticles = nullptr;
 		event.retrieve(bosonsWithDecayParticles, "TruthBosonsWithDecayParticles");
+
+		const xAOD::TruthVertexContainer* decayVertices = nullptr;
+		event.retrieve(decayVertices, "TruthVertices");
+
+		const xAOD::TruthParticleContainer* allParticles = nullptr;
+		event.retrieve(allParticles, "TruthParticles");
+		const static SG::AuxElement::ConstAccessor<unsigned int> particleOrigin("classifierParticleOrigin");
 
 		//matches bosons to decay products
 		std::vector<BosonWithDecay> eventBosons = findBosons(bosonsWithDecayParticles);
@@ -244,21 +295,58 @@ int main(int argc, char* argv[]) {
 			weightj = weights[0];
 
 			//getting d2 in both frames, along with the given d2
-			D2rest = getD2rest(jetMin->getConstituents(), jetMinVec, jetMin->numConstituents());
+			D2rest = getD2rest(jetMin->getConstituents(), jetMinVec, jetMin->numConstituents(), 1.0);
 			D2lab = getD2lab(jetMin->getConstituents(), jetMinVec, jetMin->numConstituents());
+
+			//Perform clustering and store subjets
+			std::vector<fastjet::PseudoJet> subjets = restClustering(jetMin, subjetRadius, jetMinVec);
+
+			//storing variables for tree analysis
+			numSubjets = subjets.size();
+			leadSubjetPt = subjets[0].perp();
+			subjetAngle = subjetAngles(subjets, bos1);
+			extEnergy1 = getD2rest(jetMin->getConstituents(), jetMinVec, jetMin->numConstituents(), 1.3);
+			extEnergy2 = getD2rest(jetMin->getConstituents(), jetMinVec, jetMin->numConstituents(), 1.7);
+			extEnergy3 = getD2rest(jetMin->getConstituents(), jetMinVec, jetMin->numConstituents(), 2.0);
 
 			//gets D2 given in file, (only applies if taking from some branches)
 			if (jetMin->getAttribute< float >("D2", d2)) d2refj = d2;
 			else d2refj = -100;
 			t->Fill();
-			
+
+			/******/ /*
+			if (eventCounter == 14) {
+
+				xAOD::JetConstituentVector particles = jetMin->getConstituents();
+				int numParts = jetMin->numConstituents();
+
+				ROOT::Math::Boost jetBoost(jetMinVec.BoostToCM());
+
+				double eta[numParts], phi[numParts];
+				for (int i = 0; i < numParts; i++) {
+					
+					ROOT::Math::PtEtaPhiMVector particle(particles[i].pt(), particles[i].eta(), particles[i].phi(), particles[i].m());
+					ROOT::Math::PtEtaPhiMVector particleb(jetBoost(particle));
+
+					eta[i] = particleb.eta();
+					phi[i] = particleb.phi();
+					
+				}
+				
+				TGraph * eventPlot = new TGraph(numParts, eta, phi);
+				eventPlot->Write();
+
+			}
+
+			eventCounter++;
+			*/ /******/
+
 		}
 
 	}
 
 	//writes and closes the file
     t->Write();
-	//RPlot->Write();
     oFile->Close();
     
     return 0;
@@ -298,8 +386,6 @@ std::vector<BosonWithDecay> findBosons(const xAOD::TruthParticleContainer* parti
 		
 	}
 	if (current.v) out.push_back(current);
-
-	if (out.size() > 2) std::cout << "WARNING! bosonsWithDecay() found more than 2 bosons" << std::endl;
 
 	return out;
 }
@@ -400,12 +486,13 @@ double getD2lab(xAOD::JetConstituentVector particles, ROOT::Math::PtEtaPhiMVecto
 	//calculate d2
 	return (e3lab / pow(e2lab, 3)); 
     //d2 = e3 / e2^3
+
 }
 
 
 
 //calculates d2 in the jet rest frame
-double getD2rest(xAOD::JetConstituentVector particles, ROOT::Math::PtEtaPhiMVector jetFrame, long long p) {
+double getD2rest(xAOD::JetConstituentVector particles, ROOT::Math::PtEtaPhiMVector jetFrame, long long p, double betaGiven) {
 	
 	double e2rest = 0;
 	double e3rest = 0;
@@ -438,10 +525,10 @@ double getD2rest(xAOD::JetConstituentVector particles, ROOT::Math::PtEtaPhiMVect
 			ROOT::Math::PtEtaPhiMVector part2b(jetBoost(part2));
 			
 			//gets angles
-			a1rest = ROOT::Math::VectorUtil::Angle(part1b, part2b);
+			a1rest = (1 / ROOT::Math::VectorUtil::Angle(part1b, part2b));
 			
 			//adds to e2 energy correlation
-			e2rest += part1b.e() * part2b.e() * pow(a1rest, betaVar);
+			e2rest += part1b.e() * part2b.e() * pow(a1rest, betaGiven);
 			
 			
 			//loop over every third particle to combine with first two
@@ -454,14 +541,16 @@ double getD2rest(xAOD::JetConstituentVector particles, ROOT::Math::PtEtaPhiMVect
 				ROOT::Math::PtEtaPhiMVector part3b(jetBoost(part3));
 				
 				//gets angles
-				a2rest = ROOT::Math::VectorUtil::Angle(part2b, part3b);
-				a3rest = ROOT::Math::VectorUtil::Angle(part1b, part3b);
+				a2rest = (1 / ROOT::Math::VectorUtil::Angle(part2b, part3b));
+				a3rest = (1 / ROOT::Math::VectorUtil::Angle(part1b, part3b));
 				
 				//adds to e3 energy correlation
-				e3rest += part1b.e() * part2b.e() * part3b.e() * pow(a1rest * a2rest * a3rest, betaVar); //check about e function again
+				e3rest += part1b.e() * part2b.e() * part3b.e() * pow(a1rest * a2rest * a3rest, betaGiven); //check about e function again
 				
 			}
+
 		}
+
 	}
 	
 	//normalize e2 and e3
@@ -471,4 +560,151 @@ double getD2rest(xAOD::JetConstituentVector particles, ROOT::Math::PtEtaPhiMVect
 	//calculate d2
 	return (e3rest / pow(e2rest, 3)); 
     //d2 = e3 / e2^3
+}
+
+
+
+//clusters to find subjets in rest frame of jet
+const std::vector<fastjet::PseudoJet> restClustering(const xAOD::Jet* jet, double subjetAngle, ROOT::Math::PtEtaPhiMVector restVec) {
+
+	//declare constituent vector to loop, and boost
+	std::vector<fastjet::PseudoJet> constituents;
+	ROOT::Math::Boost restBoost(restVec.BoostToCM());
+	
+	//looping over constituents, boosting to jet frame and adding them for clustering
+	for (const auto* constituent : jet->getConstituents()) {
+		
+		ROOT::Math::PtEtaPhiMVector particle(constituent->pt(), constituent->eta(), constituent->phi(), constituent->m());
+		ROOT::Math::PtEtaPhiMVector particleBoosted(restBoost(particle));
+		constituents.push_back(fastjet::PseudoJet( particleBoosted.px(), particleBoosted.py(), particleBoosted.pz(), particleBoosted.E()));
+		
+	}
+
+	//Perform clustering and store subjets
+	fastjet::JetDefinition jet_def(fastjet::antikt_algorithm, subjetAngle);
+	fastjet::ClusterSequence cs(constituents, jet_def);
+	std::vector<fastjet::PseudoJet> subjets = sorted_by_pt(cs.inclusive_jets());
+
+	//if subjet output is toggled on, it will read out subjet information
+	if (subjetOutput) {
+
+		std::cout << "     pt y phi" << std::endl;
+		for (unsigned i = 0; i < subjets.size(); i++) {
+			
+			std::cout << "jet " << i << ": "<< subjets[i].perp() << " "
+				<< subjets[i].rap() << " " << subjets[i].phi() << std::endl;
+			
+			std::vector<fastjet::PseudoJet> constituents = subjets[i].constituents();
+			
+			for (unsigned j = 0; j < constituents.size(); j++) {
+				
+				std::cout << " constituent " << j << "’s pt: "<< constituents[j].perp() << std::endl;
+
+			}
+
+		}
+
+	}
+	
+	return subjets;
+
+}
+
+
+
+//takes a vector of two subjets, and boosts into the boson frame and check their angle
+double subjetAngles(std::vector<fastjet::PseudoJet> subjets, ROOT::Math::PtEtaPhiMVector bosonFrame) {
+
+	//for boosting into boson frame
+	ROOT::Math::Boost bosonBoost(bosonFrame.BoostToCM());
+
+	//boosting subjets
+	ROOT::Math::PtEtaPhiMVector subjet1(subjets[0].perp(), subjets[0].eta(), subjets[0].phi(), subjets[0].m());
+	ROOT::Math::PtEtaPhiMVector subjet1b(bosonBoost(subjet1));
+
+	ROOT::Math::PtEtaPhiMVector subjet2(subjets[1].perp(), subjets[1].eta(), subjets[1].phi(), subjets[1].m());
+	ROOT::Math::PtEtaPhiMVector subjet2b(bosonBoost(subjet2));
+
+	//find and return angle
+	return ROOT::Math::VectorUtil::Angle(subjet1, subjet2);
+
+}
+
+
+
+//boosts subjet axes into jet frame, and finds how much energy of the jet falls outside a certain radius around the subjet axes
+double externalEnergy(xAOD::JetConstituentVector constituents, std::vector<fastjet::PseudoJet> subjets, ROOT::Math::PtEtaPhiMVector jetFrame, double angleCuttoff) {
+
+	long long numConstituents = constituents.size();
+	ROOT::Math::Boost jetBoost(jetFrame.BoostToCM());
+
+	//energy totals
+	double energyInt = 0;
+	double energyIntsub1 = 0;
+	double energyIntsub2 = 0;
+	double energyTotal = 0;
+
+	if (subjets.size() < 2) return -100;
+
+	//subjet vectors
+	ROOT::Math::PtEtaPhiMVector subjet1(subjets[0].perp(), subjets[0].eta(), subjets[0].phi(), subjets[0].m());
+	ROOT::Math::PtEtaPhiMVector subjet2(subjets[1].perp(), subjets[1].eta(), subjets[1].phi(), subjets[1].m());
+
+	for (int i = 0; i < numConstituents; i++) {
+
+		ROOT::Math::PtEtaPhiMVector constituentVec(constituents[i].pt(), constituents[i].eta(), constituents[i].phi(), constituents[i].m());
+		ROOT::Math::PtEtaPhiMVector constituentVecb(jetBoost(constituentVec));
+		energyTotal += constituentVecb.E();
+		double angle1 = ROOT::Math::VectorUtil::Angle(subjet1, constituentVecb);
+		double angle2 = ROOT::Math::VectorUtil::Angle(subjet2, constituentVecb);
+
+		if (angle1 < angleCuttoff) energyIntsub1 += constituentVecb.E();
+		if (angle2 < angleCuttoff) energyIntsub2 += constituentVecb.E();
+
+		if (angle1 < angleCuttoff || angle2 < angleCuttoff) energyInt += constituentVecb.E();
+
+	}
+
+	if (std::max(energyIntsub1, energyIntsub2) > 0) return std::min(energyIntsub1, energyIntsub2) / std::max(energyIntsub1, energyIntsub2);
+	else return -1;
+
+}
+
+
+
+//finds particles decaying from input particle
+const std::vector<xAOD::TruthParticle> truthParticlesNoPU(const xAOD::TruthParticle* origin) {
+	
+	std::vector<xAOD::TruthParticle> products;
+
+	//if particle decays, find all results of its decay
+	if (origin->hasDecayVtx()) {
+
+		//getting decay information
+		const xAOD::TruthVertex* decayVertex = origin->decayVtx();
+		long long outPartNum = decayVertex->nOutgoingParticles();
+
+		//loop over its products
+		for (int i = 0; i < outPartNum; i++) {
+
+			//for each product, find results of potential further decay
+			const xAOD::TruthParticle* temp = decayVertex->outgoingParticle(i);
+			std::vector<xAOD::TruthParticle> primaryProducts = truthParticlesNoPU(decayVertex->outgoingParticle(i));
+			if (temp->hasDecayVtx()) std::cout << "primary products decayed\n";
+
+			//add its products and secondary products to the total vector of constituents
+			int prodOutSize = primaryProducts.size();
+			for (int j = 0; j < prodOutSize; j++) {
+
+				products.push_back(primaryProducts[j]);
+
+			}
+
+		}
+
+	}
+	else products.push_back(*origin);
+
+	return products;
+
 }
